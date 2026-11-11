@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+    <title>The RPC Gazette · a Go net/rpc CRUD with an RSA login</title>
+    <meta name="description" content="A Go net/rpc server and client with an RSA-encrypted login, running in your browser. Every call is printed like a newspaper, with its bytes on the wire." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='%23f6f1e7'/><text x='32' y='47' font-family='Georgia,serif' font-size='44' font-weight='700' text-anchor='middle' fill='%23151515'>R</text></svg>" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="dateline">
+        <span id="date"></span>
+        <span id="edition">Printing in your browser</span>
+        <span id="issue">No. 0</span>
+      </div>
+      <h1 class="title">The RPC Gazette</h1>
+      <p class="motto">All the calls that are fit to print · Go <code>net/rpc</code> over a connection, with an RSA login</p>
+      <nav class="sections" aria-label="Sections">
+        <a href="#front">Front page</a>
+        <a href="#classifieds">Classifieds</a>
+        <a href="#wire">The wire</a>
+        <a href="#telegraph">Telegraph</a>
+        <a href="#how">How it works</a>
+        <a href="https://github.com/rahelmartim/go-rpc-rsa-crud" target="_blank" rel="noopener noreferrer">Source</a>
+        <button class="link" id="reset" type="button">Start over</button>
+      </nav>
+    </header>
+
+    <p class="presses" id="presses" role="status">The presses are warming up: Go is making two 2048-bit RSA keys…</p>
+
+    <main class="paper" id="paper" hidden>
+      <!-- Lead story: the handshake and the login -->
+      <article class="lead" id="front">
+        <p class="kicker">Security</p>
+        <h2 class="headline">Client and server trade keys in a handshake</h2>
+        <p class="deck">
+          Each side made a 2048-bit RSA key pair. The client sent its public key, and the server answered with its own.
+          A fingerprint is a short hash of a key: when two fingerprints match, the keys are the same.
+        </p>
+        <div class="keys">
+          <figure>
+            <figcaption>Key of the client</figcaption>
+            <code id="client-key">…</code>
+          </figure>
+          <figure>
+            <figcaption>Key of the server</figcaption>
+            <code id="server-key">…</code>
+          </figure>
+          <figure>
+            <figcaption>Server key, as the client received it</figcaption>
+            <code id="client-knows">…</code>
+            <span class="match" id="match"></span>
+          </figure>
+        </div>
+
+        <h3 class="subhead">A login sent in a sealed envelope</h3>
+        <p>
+          The client encrypts the user and the password with the public key of the server (RSA-OAEP with SHA-256).
+          Only the private key of the server can open it. The demo account is <strong>admin</strong> with the
+          password <strong>chatuba</strong>.
+        </p>
+        <form class="login" id="login-form" autocomplete="off">
+          <label>User <input name="user" value="admin" maxlength="32" /></label>
+          <label>Password <input name="password" value="chatuba" maxlength="64" /></label>
+          <button class="btn">Seal and send</button>
+          <button class="btn quiet" type="button" id="logout">Log out</button>
+        </form>
+        <div class="sealed" id="sealed" hidden>
+          <div>
+            <p class="label">What the client wrote</p>
+            <pre id="plaintext"></pre>
+          </div>
+          <div>
+            <p class="label">What went on the wire <span id="cipher-size"></span></p>
+            <pre class="cipher" id="ciphertext"></pre>
+          </div>
+          <p class="verdict" id="verdict"></p>
+        </div>
+      </article>
+
+      <!-- The server log -->
+      <aside class="desk">
+        <p class="kicker">Dispatches</p>
+        <h2 class="headline small">From the server desk</h2>
+        <p class="byline">What the server wrote in its log, newest first. It never writes a password.</p>
+        <ol class="desk-lines" id="desk"></ol>
+      </aside>
+
+      <!-- The catalog -->
+      <section class="classifieds" id="classifieds">
+        <p class="kicker">Classifieds</p>
+        <h2 class="headline small">Products for sale</h2>
+        <p class="byline" id="session-line"></p>
+        <table class="ads">
+          <thead>
+            <tr><th>No.</th><th>Item</th><th class="num">Price</th><th><span class="sr">Actions</span></th></tr>
+          </thead>
+          <tbody id="products"></tbody>
+        </table>
+        <form class="ad-form" id="product-form" autocomplete="off">
+          <p class="label" id="form-title">Place an ad</p>
+          <input type="hidden" name="id" />
+          <input name="name" placeholder="item, such as tea" maxlength="40" aria-label="Item" required />
+          <input name="price" placeholder="price, such as 3.50" maxlength="13" aria-label="Price" inputmode="decimal" required />
+          <button class="btn" id="product-save">Print it</button>
+          <button class="btn quiet" type="button" id="product-cancel" hidden>Cancel</button>
+        </form>
+        <p class="notice" id="notice" role="status"></p>
+      </section>
+
+      <!-- The calls -->
+      <section class="wire" id="wire">
+        <p class="kicker">The wire</p>
+        <h2 class="headline small">Every call, as it happened</h2>
+        <p class="byline">Each call of the client to <code>Products</code>, newest first. Open one to read its bytes, encoded by <code>encoding/gob</code>.</p>
+        <div class="stories" id="stories"></div>
+      </section>
+
+      <!-- Command line -->
+      <section class="telegraph" id="telegraph">
+        <p class="kicker">Telegraph</p>
+        <h2 class="headline small">Send a command, as the original client did</h2>
+        <pre class="tape" id="tape" aria-live="polite">Type .help for the list of commands.</pre>
+        <form class="telegraph-form" id="telegraph-form" autocomplete="off">
+          <span class="prompt" aria-hidden="true">&gt;</span>
+          <input name="line" placeholder=".create tea 3.50" maxlength="200" aria-label="Command" spellcheck="false" />
+          <button class="btn">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <section class="how" id="how" aria-label="How it works">
+      <h2 class="section-title">How it works</h2>
+      <div class="how-grid">
+        <article>
+          <h3>The handshake</h3>
+          <p>The client calls <code>Products.Handshake</code> with its public key in the PKIX format. The server keeps it for the connection, and replies with its own public key. The server refuses keys smaller than 2048 bits.</p>
+        </article>
+        <article>
+          <h3>The sealed login</h3>
+          <p>The client writes <code>{"user", "password"}</code> as JSON and encrypts it with RSA-OAEP. The ciphertext is 256 bytes, and it is different each time. The server compares the hashes in constant time, and allows three failed tries on each connection.</p>
+        </article>
+        <article>
+          <h3>One session for each connection</h3>
+          <p>The server registers a new service for each connection, so a login is valid only on its own connection. The catalog is shared by all connections, and a lock protects it.</p>
+        </article>
+        <article>
+          <h3>The wire</h3>
+          <p><code>net/rpc</code> encodes each call with <code>encoding/gob</code>. Gob sends the definition of a type the first time that the type is used, so the first call of a kind is larger. Only the login is encrypted. Use TLS to protect the other calls.</p>
+        </article>
+      </div>
+    </section>
+
+    <footer class="colophon">
+      Printed in Go by <a href="https://github.com/rahelmartim" target="_blank" rel="noopener noreferrer">rahelmartim</a>.
+      The server and the client run in this page with WebAssembly, over an in-memory connection.
+    </footer>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
