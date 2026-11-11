@@ -10,13 +10,11 @@ import (
 )
 
 // Help lists the commands of Exec.
-const Help = `.login <user> <password>     log in (the message is encrypted with RSA)
-.create <name> <price>        add a product, such as .create rice 4.50
+const Help = `.create <name> <price>        add a product, such as .create rice 4.50
 .read <id>                    show one product
 .update <id> <name> <price>   change a product
 .delete <id>                  remove a product
 .list                         show all products
-.logout                       end the login
 .help                         show this list
 .quit                         close the connection`
 
@@ -40,11 +38,11 @@ func (c *Client) Exec(line string) (string, error) {
 		return "", errors.New("commands start with a dot, such as .list. Type .help for the list")
 	}
 	usage := map[string]string{
-		".login": ".login <user> <password>", ".create": ".create <name> <price>", ".read": ".read <id>",
+		".create": ".create <name> <price>", ".read": ".read <id>",
 		".update": ".update <id> <name> <price>", ".delete": ".delete <id>",
-		".list": ".list", ".logout": ".logout", ".help": ".help", ".quit": ".quit",
+		".list": ".list", ".help": ".help", ".quit": ".quit",
 	}
-	want := map[string]int{".login": 2, ".create": 2, ".read": 1, ".update": 3, ".delete": 1}
+	want := map[string]int{".create": 2, ".read": 1, ".update": 3, ".delete": 1}
 	u, ok := usage[cmd]
 	if !ok {
 		return "", fmt.Errorf("%s is not a command. Type .help for the list", cmd)
@@ -66,13 +64,6 @@ func (c *Client) Exec(line string) (string, error) {
 		return Help, nil
 	case ".quit":
 		return "bye", ErrQuit
-	case ".login":
-		if err := c.Login(args[0], args[1]); err != nil {
-			return "", err
-		}
-		return "logged in as " + args[0], nil
-	case ".logout":
-		return "logged out", c.Logout()
 	case ".create":
 		p, err := c.Create(args[0], args[1])
 		if err != nil {

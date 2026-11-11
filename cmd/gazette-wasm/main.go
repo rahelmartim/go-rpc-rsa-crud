@@ -3,11 +3,12 @@
 // The WebAssembly build of The RPC Gazette. It runs the real server and
 // client in the browser, over an in-memory connection.
 //
-// It sets a global object "gazette" with two functions that return
-// promises of JSON text:
+// It sets a global object "gazette" with functions that return promises
+// of JSON text:
 //
-//	gazette.do(action, argsJSON) → {"ok": true, "state": {...}} or {"ok": false, "error": "...", "state": {...}}
-//	gazette.exec(line)           → the same, with "output"
+//	gazette.exec(line) → {"ok": true, "entry": {...}, "state": {...}}, or "ok": false with "error"
+//	gazette.state()    → {"ok": true, "state": {...}}
+//	gazette.reset()    → {"ok": true, "state": {...}}
 //
 // It dispatches the "gazette-ready" event when the keys are ready.
 package main
@@ -20,10 +21,10 @@ import (
 )
 
 type reply struct {
-	OK     bool          `json:"ok"`
-	Error  string        `json:"error,omitempty"`
-	Output string        `json:"output,omitempty"`
-	State  gazette.State `json:"state"`
+	OK    bool           `json:"ok"`
+	Error string         `json:"error,omitempty"`
+	Entry *gazette.Entry `json:"entry,omitempty"`
+	State gazette.State  `json:"state"`
 }
 
 func encode(r reply, err error) string {
@@ -54,31 +55,23 @@ func main() {
 		return
 	}
 	api := js.Global().Get("Object").New()
-	api.Set("do", js.FuncOf(func(_ js.Value, args []js.Value) any {
-		if len(args) < 1 {
-			return nil
-		}
-		action, raw := args[0].String(), "{}"
-		if len(args) > 1 {
-			raw = args[1].String()
+	api.Set("exec", js.FuncOf(func(_ js.Value, args []js.Value) any {
+		line := ""
+		if len(args) > 0 {
+			line = args[0].String()
 		}
 		return promise(func() string {
-			var in map[string]string
-			if err := json.Unmarshal([]byte(raw), &in); err != nil {
-				return encode(reply{State: engine.State()}, err)
-			}
-			state, err := engine.Do(action, in)
-			return encode(reply{State: state}, err)
+			entry, state, err := engine.Exec(line)
+			return encode(reply{Entry: &entry, State: state}, err)
 		})
 	}))
-	api.Set("exec", js.FuncOf(func(_ js.Value, args []js.Value) any {
-		if len(args) < 1 {
-			return nil
-		}
-		line := args[0].String()
+	api.Set("state", js.FuncOf(func(js.Value, []js.Value) any {
+		return promise(func() string { return encode(reply{State: engine.State()}, nil) })
+	}))
+	api.Set("reset", js.FuncOf(func(js.Value, []js.Value) any {
 		return promise(func() string {
-			out, state, err := engine.Exec(line)
-			return encode(reply{Output: out, State: state}, err)
+			state, err := engine.Reset()
+			return encode(reply{State: state}, err)
 		})
 	}))
 	js.Global().Set("gazette", api)

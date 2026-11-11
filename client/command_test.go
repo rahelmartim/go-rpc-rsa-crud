@@ -22,7 +22,7 @@ func newClient(t *testing.T) *client.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &service.Server{Catalog: catalog.New(), Key: serverKey, User: "admin", Password: "chatuba"}
+	s := &service.Server{Catalog: catalog.New(), Key: serverKey}
 	near, far := net.Pipe()
 	go s.ServeConn(far)
 	c := client.New(near, clientKey)
@@ -39,11 +39,8 @@ func TestCommands(t *testing.T) {
 		{"", "", ""},
 		{"list", "", "commands start with a dot"},
 		{".dance", "", ".dance is not a command"},
-		{".list", "", "log in first"},
-		{".login admin", "", "usage: .login <user> <password>"},
-		{".login admin nope", "", "wrong user or password"},
-		{".LOGIN admin chatuba", "logged in as admin", ""},
-		{".list", "the catalog is empty", ""},
+		{".login admin secret", "", ".login is not a command"},
+		{".LIST", "the catalog is empty", ""},
 		{".create rice 4.50", "created #1  rice  4.50", ""},
 		{".create coffee 12,9", "created #2  coffee  12.90", ""},
 		{".create tea", "", "usage: .create <name> <price>"},
@@ -58,8 +55,6 @@ func TestCommands(t *testing.T) {
 		{".delete 2", "", "no product has this id"},
 		{".list", "#1  brown_rice  5.00", ""},
 		{".help", ".create <name> <price>", ""},
-		{".logout", "logged out", ""},
-		{".read 1", "", "log in first"},
 	}
 	for _, s := range steps {
 		out, err := c.Exec(s.line)
@@ -83,15 +78,30 @@ func TestSealNeedsTheServerKey(t *testing.T) {
 	near, _ := net.Pipe()
 	c := client.New(near, key)
 	defer c.Close()
-	if _, err := c.Seal("admin", "x"); !errors.Is(err, service.ErrNoHandshake) {
-		t.Fatalf("Seal before the handshake: %v", err)
+	if _, err := c.List(); !errors.Is(err, service.ErrNoHandshake) {
+		t.Fatalf("a call before the handshake: %v", err)
 	}
 }
 
-func TestCredentialsThatAreTooLong(t *testing.T) {
+func TestTraceSeesBothSides(t *testing.T) {
 	c := newClient(t)
-	if _, err := c.Seal("admin", strings.Repeat("x", 300)); err == nil || !strings.Contains(err.Error(), "too long") {
-		t.Fatalf("Seal of a long password: %v", err)
+	var calls []client.Call
+	c.Trace = func(call client.Call) { calls = append(calls, call) }
+	if _, err := c.Create("tea", "3.50"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("%d traced calls", len(calls))
+	}
+	call := calls[0]
+	if call.Method != "Create" || string(call.Request) != `{"name":"tea","price":"3.50"}` {
+		t.Fatalf("request %q", call.Request)
+	}
+	if len(call.Sealed) != 1 || len(call.Sealed[0]) != 256 || len(call.ReplySealed) != 1 {
+		t.Fatal("the request or the reply is not sealed")
+	}
+	if !strings.Contains(string(call.Reply), `"name":"tea"`) || call.Err != nil {
+		t.Fatalf("reply %q, %v", call.Reply, call.Err)
 	}
 }
 

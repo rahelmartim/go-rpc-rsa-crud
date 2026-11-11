@@ -21,7 +21,7 @@ describe("The RPC Gazette in the browser", { skip }, () => {
     chrome = await launchChrome(chromePath);
     page = await chrome.newPage({ width: 1400, height: 1200 });
     await page.goto(app.url);
-    await page.waitFor("!document.querySelector('#paper').hidden", 60000);
+    await page.waitFor("!document.querySelector('#desk').hidden", 60000);
   });
 
   after(async () => {
@@ -33,130 +33,105 @@ describe("The RPC Gazette in the browser", { skip }, () => {
   // textContent, not innerText: innerText applies the uppercase of the CSS.
   const text = (selector) => page.eval(`document.querySelector(${JSON.stringify(selector)})?.textContent ?? ""`);
   const count = (selector) => page.eval(`document.querySelectorAll(${JSON.stringify(selector)}).length`);
-  const stories = () => page.eval("[...document.querySelectorAll('.story h3')].map((h) => h.textContent)");
-  const submit = (form, values) =>
-    page.eval(`(() => {
-      const form = document.querySelector(${JSON.stringify(form)});
-      for (const [k, v] of Object.entries(${JSON.stringify(values)})) form.elements[k].value = v;
-      form.requestSubmit();
+  const last = (selector) => page.eval(`[...document.querySelectorAll('.entry')].at(-1)?.querySelector(${JSON.stringify(selector)})?.textContent ?? ""`);
+
+  // type sends one command and waits until its answer is typed out.
+  async function type(line) {
+    const before = await count(".entry");
+    await page.eval(`(() => {
+      document.querySelector('#line').value = ${JSON.stringify(line)};
+      document.querySelector('#carriage').requestSubmit();
       return true;
     })()`);
-  const telegraph = async (line) => {
-    const before = await page.eval("document.querySelector('#tape').textContent.length");
-    await submit("#telegraph-form", { line });
-    await page.waitFor(`document.querySelector('#tape').textContent.length > ${before}`);
-    return page.eval("document.querySelector('#tape').textContent");
-  };
+    await page.waitFor(`document.querySelectorAll('.entry').length > ${before}`);
+    await new Promise((r) => setTimeout(r, 900)); // the typing and the scramble
+  }
 
-  test("prints the handshake on the front page", async () => {
-    assert.equal(await count("#products tr"), 3);
-    assert.deepEqual(await stories(), ["Products.Handshake"]);
+  test("starts with the handshake, not sealed", async () => {
+    assert.equal(await count(".entry"), 1);
+    assert.match(await text(".entry"), /Products\.Handshake/);
+    assert.equal(await count(".entry .stamp.open"), 2);
     const client = await text("#client-key");
-    const server = await text("#server-key");
     assert.match(client, /^([0-9a-f]{2}:){11}[0-9a-f]{2}$/);
-    assert.notEqual(client, server);
-    assert.equal(await text("#client-knows"), server);
-    assert.match(await text("#match"), /the same key/);
-    assert.match(await text("#desk"), new RegExp(`handshake: client key ${client}`));
-    assert.match(await text("#issue"), /No\. 1/);
-  });
-
-  test("the server refuses calls before the login", async () => {
-    await page.eval("document.querySelector('#products .actions button:last-child').click(), true");
-    await page.waitFor("document.querySelector('#notice').textContent.includes('log in first')");
+    assert.equal(await text("#client-knows"), await text("#server-key"));
+    assert.match(await text("#match"), /intact/);
     assert.equal(await count("#products tr"), 3);
-    assert.match(await text(".story"), /Products\.Delete[\s\S]*Refused: log in first/);
-    assert.match(await text("#desk"), /delete refused: log in first/);
   });
 
-  test("a wrong password is refused, the right one opens the envelope", async () => {
-    await submit("#login-form", { user: "admin", password: "nope" });
-    await page.waitFor("document.querySelector('#verdict').textContent.includes('refused')");
-    assert.match(await text("#verdict"), /wrong user or password/);
-
-    await submit("#login-form", { user: "admin", password: "chatuba" });
-    await page.waitFor("document.querySelector('#verdict').classList.contains('ok')");
-    assert.equal(await text("#plaintext"), '{"user":"admin","password":"chatuba"}');
-    const cipher = (await text("#ciphertext")).replaceAll("\n", "");
-    assert.match(cipher, /^[0-9a-f]{512}$/);
-    assert.match(await text("#cipher-size"), /256 bytes/);
-    assert.match(await text("#session-line"), /Logged in as admin/);
-    assert.match(await text("#desk"), /decrypted the login, admin is logged in/);
-    assert.doesNotMatch(await text("#desk"), /chatuba|nope/);
-  });
-
-  test("the bytes of the login on the wire are the ciphertext", async () => {
-    const cipher = (await text("#ciphertext")).replaceAll("\n", "");
-    const dump = await page.eval(`(() => {
-      const story = [...document.querySelectorAll('.story')].find((s) => s.querySelector('h3').textContent === 'Products.Login' && !s.querySelector('.refused'));
-      story.querySelector('details').open = true;
-      return story.querySelector('.dump').textContent;
-    })()`);
-    const hex = dump.split("\n").map((l) => l.slice(6, 53).replaceAll(" ", "")).join("");
-    assert.ok(hex.includes(cipher.slice(0, 64)), "the dump has the start of the ciphertext");
-    assert.ok(!dump.includes("chatuba"), "the dump has no password");
-  });
-
-  test("places, changes, reads, and removes an ad", async () => {
-    await submit("#product-form", { name: "tea", price: "3,5" });
-    await page.waitFor("document.querySelectorAll('#products tr').length === 4");
-    assert.match(await text("#products"), /#4tea3\.50/);
-
-    await page.eval("[...document.querySelectorAll('#products tr')][3].querySelector('button[title=\"Change this product\"]').click(), true");
-    assert.equal(await text("#form-title"), "Change ad #4");
-    await submit("#product-form", { name: "green tea", price: "4" });
-    await page.waitFor("document.querySelector('#products').textContent.includes('green tea')");
-    assert.equal(await text("#form-title"), "Place an ad");
+  test("a command goes sealed and comes back sealed", async () => {
+    await type(".create tea 3.50");
+    assert.equal(await last(".typed"), ">.create tea 3.50");
+    assert.match(await last(".leg.out .plain"), /Products\.Create\{"name":"tea","price":"3\.50"\}/);
+    assert.match(await last(".leg.out .stamp"), /sealed · server key/);
+    assert.match(await last(".leg.back .stamp"), /sealed · client key/);
+    assert.match(await last(".leg.out .cipher"), /^[0-9a-f]{32}…1 block · 256 bytes$/);
+    assert.equal(await last(".output"), "created #4  tea  3.50");
     assert.equal(await count("#products tr"), 4);
-
-    await page.eval("[...document.querySelectorAll('#products tr')][3].querySelector('button').click(), true");
-    await page.waitFor("document.querySelector('.story h3').textContent === 'Products.Read'");
-    assert.match(await text(".story"), /green tea[\s\S]*4\.00/);
-
-    await page.eval("[...document.querySelectorAll('#products tr')][3].querySelector('.actions button:last-child').click(), true");
-    await page.waitFor("document.querySelectorAll('#products tr').length === 3");
+    assert.match(await text("#products"), /#4tea3\.50/);
   });
 
-  test("bad input comes back as a refusal, not a crash", async () => {
-    await submit("#product-form", { name: "tea", price: "free" });
-    await page.waitFor("document.querySelector('#notice').classList.contains('bad')");
-    assert.match(await text("#notice"), /a price is a number/);
-    await page.eval("document.querySelector('#product-cancel').click(), true");
+  test("the bytes on the wire hold the ciphertext, not the plaintext", async () => {
+    const result = await page.eval(`(() => {
+      const entry = [...document.querySelectorAll('.entry')].at(-1);
+      entry.querySelector('details').open = true;
+      const dumps = [...entry.querySelectorAll('.dump')].map((d) => d.textContent);
+      return { sealed: dumps[0], wire: dumps[1] + dumps[2] };
+    })()`);
+    const block = result.sealed.split("\n")[1];
+    assert.match(block, /^[0-9a-f]{512}$/);
+    const hexOfWire = result.wire.split("\n").map((l) => l.slice(6, 53).replaceAll(" ", "")).join("");
+    assert.ok(hexOfWire.includes(block.slice(0, 64)), "the block is on the wire");
+    // The hexdump wraps the text column every 16 bytes, so look in the hex.
+    const hexOf = (s) => [...s].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+    assert.ok(hexOfWire.includes(hexOf("Products.Create")), "the method name is on the wire");
+    assert.ok(!hexOfWire.includes(hexOf('"tea"')), "the plaintext is not on the wire");
   });
 
-  test("the telegraph runs the commands of the original client", async () => {
-    let tape = await telegraph(".list");
-    assert.match(tape, /#2 {2}coffee {2}12\.90/);
-    tape = await telegraph(".read 99");
-    assert.match(tape, /error: no product has this id/);
-    tape = await telegraph("hello");
-    assert.match(tape, /commands start with a dot/);
-    tape = await telegraph(".help");
-    assert.match(tape, /\.update <id> <name> <price>/);
-    tape = await telegraph(".logout");
-    assert.match(tape, /logged out/);
-    assert.match(await text("#session-line"), /not logged in/);
+  test("errors come back sealed too", async () => {
+    await type(".read 99");
+    assert.equal(await last(".output"), "error: no product has this id");
+    assert.match(await last(".leg.back .plain"), /\{"error":"no product has this id"\}/);
+    assert.match(await last(".leg.back .stamp"), /sealed/);
   });
 
-  test("the first call of a kind carries the gob type definitions", async () => {
-    await page.click("#reset");
-    await page.waitFor("document.querySelectorAll('.story').length === 1");
-    await telegraph(".login admin chatuba");
-    await telegraph(".read 1");
-    await telegraph(".read 2");
-    const sizes = await page.eval(`[...document.querySelectorAll('.story')]
-      .filter((s) => s.querySelector('h3').textContent === 'Products.Read' && !s.querySelector('.refused'))
-      .map((s) => Number(s.querySelector('.meta').textContent.match(/(\\d+) B in/)[1]))`);
-    // Newest first: the second read is smaller than the first.
-    assert.ok(sizes.length >= 2 && sizes[0] < sizes.at(-1), `sizes ${sizes}`);
+  test("a typing error never reaches the wire", async () => {
+    await type(".create tea");
+    assert.equal(await last(".output"), "error: usage: .create <name> <price>");
+    assert.equal(await page.eval("[...document.querySelectorAll('.entry')].at(-1).querySelectorAll('.leg').length"), 0);
+    await type("hello");
+    assert.match(await last(".output"), /commands start with a dot/);
   });
 
-  test("start over opens a new connection", async () => {
-    await page.click("#reset");
-    await page.waitFor("document.querySelectorAll('.story').length === 1");
+  test("updates, deletes, and lists", async () => {
+    await type(".update 1 brown_rice 5");
+    assert.equal(await last(".output"), "updated #1  brown_rice  5.00");
+    await type(".delete 3");
+    assert.equal(await last(".output"), "deleted #3");
+    await type(".list");
+    assert.match(await last(".output"), /#1 {2}brown_rice {2}5\.00\n#2 {2}coffee {2}12\.90\n#4 {2}tea {2}3\.50/);
     assert.equal(await count("#products tr"), 3);
-    assert.equal(await page.eval("document.querySelector('#sealed').hidden"), true);
-    assert.match(await text("#session-line"), /not logged in/);
+  });
+
+  test("the chips fill the carriage, and the arrows recall commands", async () => {
+    await page.eval("[...document.querySelectorAll('#chips button')].find((b) => b.textContent === '.help').click(), true");
+    assert.equal(await page.eval("document.querySelector('#line').value"), ".help");
+    await page.eval("document.querySelector('#line').value = ''; true");
+    await page.eval("document.querySelector('#line').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp' })), true");
+    assert.equal(await page.eval("document.querySelector('#line').value"), ".list");
+  });
+
+  test(".clear empties the sheet, and Start over opens a new connection", async () => {
+    await type(".help");
+    await page.eval(`(() => {
+      document.querySelector('#line').value = '.clear';
+      document.querySelector('#carriage').requestSubmit();
+      return true;
+    })()`);
+    await page.waitFor("document.querySelectorAll('.entry').length === 0");
+    await page.click("#reset");
+    await page.waitFor("document.querySelectorAll('.entry').length === 1");
+    assert.equal(await count("#products tr"), 3);
+    assert.match(await text("#issue"), /No\. 1 /);
   });
 
   test("the page had no JavaScript errors", () => {

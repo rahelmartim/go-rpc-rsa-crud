@@ -3,6 +3,7 @@ package service_test
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/rpc"
@@ -15,8 +16,6 @@ import (
 	"github.com/rahelmartim/go-rpc-rsa-crud/keys"
 	"github.com/rahelmartim/go-rpc-rsa-crud/service"
 )
-
-const password = "chatuba"
 
 var (
 	keyOnce    sync.Once
@@ -57,15 +56,20 @@ func (l *logBook) text() string {
 func newServer(t *testing.T) (*service.Server, *logBook) {
 	testKeys(t)
 	book := &logBook{}
-	return &service.Server{Catalog: catalog.New(), Key: serverKey, User: "admin", Password: password, Log: book.add}, book
+	return &service.Server{Catalog: catalog.New(), Key: serverKey, Log: book.add}, book
 }
 
-// connect opens an in-memory connection to the server.
-func connect(t *testing.T, s *service.Server) *client.Client {
-	t.Helper()
+// pipe opens an in-memory connection to the server.
+func pipe(s *service.Server) net.Conn {
 	near, far := net.Pipe()
 	go s.ServeConn(far)
-	c := client.New(near, clientKey)
+	return near
+}
+
+// connect opens a connection and does the handshake.
+func connect(t *testing.T, s *service.Server) *client.Client {
+	t.Helper()
+	c := client.New(pipe(s), clientKey)
 	t.Cleanup(func() { c.Close() })
 	if err := c.Handshake(); err != nil {
 		t.Fatal(err)
@@ -82,15 +86,14 @@ func wantError(t *testing.T, err error, text string) {
 
 func TestHandshakeComesFirst(t *testing.T) {
 	s, _ := newServer(t)
-	near, far := net.Pipe()
-	go s.ServeConn(far)
-	raw := rpc.NewClient(near)
+	raw := rpc.NewClient(pipe(s))
 	defer raw.Close()
-
-	err := raw.Call("Products.Login", service.LoginArgs{Ciphertext: []byte("x")}, &service.Message{})
+	blocks, _ := keys.Seal(&serverKey.PublicKey, []byte(`{"name":"rice","price":"1"}`))
+	err := raw.Call("Products.Create", service.Sealed{Blocks: blocks}, &service.Sealed{})
 	wantError(t, err, service.ErrNoHandshake.Error())
-	err = raw.Call("Products.Create", service.ProductArgs{Name: "rice", Price: "1"}, &catalog.Product{})
-	wantError(t, err, service.ErrNoHandshake.Error())
+	if len(s.Catalog.List()) != 0 {
+		t.Fatal("a call before the handshake changed the catalog")
+	}
 }
 
 func TestHandshakeExchangesKeys(t *testing.T) {
@@ -106,100 +109,20 @@ func TestHandshakeExchangesKeys(t *testing.T) {
 
 func TestHandshakeRefusesWeakKeys(t *testing.T) {
 	s, _ := newServer(t)
-	near, far := net.Pipe()
-	go s.ServeConn(far)
 	small, _ := rsa.GenerateKey(rand.Reader, 1024)
-	c := client.New(near, small)
+	c := client.New(pipe(s), small)
 	defer c.Close()
 	wantError(t, c.Handshake(), "smaller than 2048 bits")
 
-	raw := rpc.NewClient(rawConn(s))
+	raw := rpc.NewClient(pipe(s))
 	defer raw.Close()
 	err := raw.Call("Products.Handshake", service.HandshakeArgs{ClientKey: []byte("junk")}, &service.HandshakeReply{})
 	wantError(t, err, "not an RSA public key")
 }
 
-func rawConn(s *service.Server) net.Conn {
-	near, far := net.Pipe()
-	go s.ServeConn(far)
-	return near
-}
-
-func TestLoginIsNeeded(t *testing.T) {
-	s, _ := newServer(t)
-	c := connect(t, s)
-	_, err := c.Create("rice", "1")
-	wantError(t, err, "log in first")
-	_, err = c.List()
-	wantError(t, err, "log in first")
-	_, err = c.Read(1)
-	wantError(t, err, "log in first")
-	wantError(t, c.Delete(1), "log in first")
-	if len(s.Catalog.List()) != 0 {
-		t.Fatal("a call without login changed the catalog")
-	}
-}
-
-func TestWrongPasswordAndTheLimit(t *testing.T) {
-	s, book := newServer(t)
-	c := connect(t, s)
-	wantError(t, c.Login("admin", "wrong"), "wrong user or password")
-	wantError(t, c.Login("root", password), "wrong user or password")
-	wantError(t, c.Login("admin", ""), "wrong user or password")
-	// After three failures, even the right password does not work on this
-	// connection.
-	wantError(t, c.Login("admin", password), "too many failed logins")
-
-	// A new connection starts again.
-	if err := connect(t, s).Login("admin", password); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(book.text(), password) || strings.Contains(book.text(), "wrong") {
-		t.Fatalf("the log shows a password:\n%s", book.text())
-	}
-}
-
-func TestAnEmptyServerPasswordRefusesAll(t *testing.T) {
-	s, _ := newServer(t)
-	s.Password = ""
-	wantError(t, connect(t, s).Login("admin", ""), "wrong user or password")
-}
-
-func TestLoginIsPerConnection(t *testing.T) {
-	s, _ := newServer(t)
-	alice, bob := connect(t, s), connect(t, s)
-	if err := alice.Login("admin", password); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := alice.Create("rice", "4.50"); err != nil {
-		t.Fatal(err)
-	}
-	_, err := bob.Read(1)
-	wantError(t, err, "log in first")
-
-	// The catalog is shared: after its login, bob sees the product of alice.
-	if err := bob.Login("admin", password); err != nil {
-		t.Fatal(err)
-	}
-	if p, err := bob.Read(1); err != nil || p.Name != "rice" {
-		t.Fatalf("Read = %+v, %v", p, err)
-	}
-	if err := alice.Logout(); err != nil {
-		t.Fatal(err)
-	}
-	_, err = alice.List()
-	wantError(t, err, "log in first")
-	if _, err := bob.List(); err != nil {
-		t.Fatalf("the logout of alice ended the login of bob: %v", err)
-	}
-}
-
 func TestCRUD(t *testing.T) {
 	s, book := newServer(t)
 	c := connect(t, s)
-	if err := c.Login("admin", password); err != nil {
-		t.Fatal(err)
-	}
 	rice, err := c.Create("rice", "4.50")
 	if err != nil || rice.ID != 1 || rice.Price != 450 {
 		t.Fatalf("Create = %+v, %v", rice, err)
@@ -207,18 +130,31 @@ func TestCRUD(t *testing.T) {
 	if _, err := c.Create("coffee", "12.90"); err != nil {
 		t.Fatal(err)
 	}
-	if p, err := c.Update(1, "brown_rice", "5"); err != nil || p.Name != "brown_rice" {
+	if p, err := c.Read(1); err != nil || p.Name != "rice" {
+		t.Fatalf("Read = %+v, %v", p, err)
+	}
+	if p, err := c.Update(1, "brown rice", "5"); err != nil || p.Name != "brown rice" {
 		t.Fatalf("Update = %+v, %v", p, err)
 	}
 	if err := c.Delete(2); err != nil {
 		t.Fatal(err)
 	}
 	list, err := c.List()
-	if err != nil || len(list) != 1 || list[0].Name != "brown_rice" {
+	if err != nil || len(list) != 1 || list[0].Name != "brown rice" {
 		t.Fatalf("List = %+v, %v", list, err)
 	}
+	for _, line := range []string{"created #1 rice at 4.50", "updated #1 to brown rice at 5.00", "deleted #2",
+		`opened Create with the server key: {"name":"rice","price":"4.50"}`, "sealed the reply with the client key"} {
+		if !strings.Contains(book.text(), line) {
+			t.Errorf("the log has no %q:\n%s", line, book.text())
+		}
+	}
+}
 
-	_, err = c.Read(2)
+func TestErrorsComeBackSealed(t *testing.T) {
+	s, book := newServer(t)
+	c := connect(t, s)
+	_, err := c.Read(2)
 	wantError(t, err, "no product has this id")
 	_, err = c.Update(7, "tea", "1")
 	wantError(t, err, "no product has this id")
@@ -227,73 +163,125 @@ func TestCRUD(t *testing.T) {
 	wantError(t, err, "a price is a number")
 	_, err = c.Create("", "1")
 	wantError(t, err, "a name has")
+	if !strings.Contains(book.text(), "Read refused: no product has this id") {
+		t.Fatalf("log:\n%s", book.text())
+	}
 
-	for _, line := range []string{"created #1 rice at 4.50", "updated #1 to brown_rice at 5.00", "deleted #2", "read refused: no product has this id"} {
-		if !strings.Contains(book.text(), line) {
-			t.Errorf("the log has no %q:\n%s", line, book.text())
-		}
+	// The error is inside the sealed reply: only the client key opens it.
+	var traced client.Call
+	c.Trace = func(call client.Call) { traced = call }
+	_, _ = c.Read(9)
+	if len(traced.ReplySealed) != 1 || strings.Contains(string(traced.ReplySealed[0]), "no product") {
+		t.Fatal("the error is not sealed")
+	}
+	if _, err := keys.Open(strangeKey, traced.ReplySealed); err == nil {
+		t.Fatal("another key opened the reply")
+	}
+	plain, err := keys.Open(clientKey, traced.ReplySealed)
+	if err != nil || string(plain) != `{"error":"no product has this id"}` {
+		t.Fatalf("reply %q, %v", plain, err)
 	}
 }
 
-func TestBadCiphertexts(t *testing.T) {
+func TestRequestsTheServerCannotOpen(t *testing.T) {
 	s, _ := newServer(t)
-	c := connect(t, s)
+	raw := rpc.NewClient(pipe(s))
+	defer raw.Close()
+	der, _ := keys.Marshal(&clientKey.PublicKey)
+	if err := raw.Call("Products.Handshake", service.HandshakeArgs{ClientKey: der}, &service.HandshakeReply{}); err != nil {
+		t.Fatal(err)
+	}
+	call := func(blocks [][]byte) error {
+		return raw.Call("Products.List", service.Sealed{Blocks: blocks}, &service.Sealed{})
+	}
+	sealedForAnother, _ := keys.Seal(&strangeKey.PublicKey, []byte("{}"))
+	wantError(t, call(sealedForAnother), "cannot open this request")
+	wantError(t, call(nil), "cannot open this request")
+	wantError(t, call([][]byte{[]byte("short")}), "cannot open this request")
+	notJSON, _ := keys.Seal(&serverKey.PublicKey, []byte("list please"))
+	wantError(t, call(notJSON), "not valid JSON")
 
-	junk := make([]byte, serverKey.Size())
-	_, _ = rand.Read(junk)
-	_, err := c.SendLogin(client.Sealed{Ciphertext: junk})
-	wantError(t, err, "cannot be decrypted")
-	_, err = c.SendLogin(client.Sealed{Ciphertext: []byte("short")})
-	wantError(t, err, "cannot be decrypted")
-
-	// A login sealed for another server key cannot be opened.
-	c2 := connect(t, s)
-	c2.ServerKey = &strangeKey.PublicKey
-	wantError(t, c2.Login("admin", password), "cannot be decrypted")
-
-	// Encrypted, but not JSON.
-	ct, _ := keys.Encrypt(&serverKey.PublicKey, []byte("admin:chatuba"))
-	c3 := connect(t, s)
-	_, err = c3.SendLogin(client.Sealed{Ciphertext: ct})
-	wantError(t, err, "cannot be decrypted")
+	// The connection still works after the bad requests.
+	good, _ := keys.Seal(&serverKey.PublicKey, []byte("{}"))
+	if err := call(good); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestTheWireHidesThePassword(t *testing.T) {
+func TestTheWireShowsNoPlaintext(t *testing.T) {
 	s, _ := newServer(t)
-	near, far := net.Pipe()
-	go s.ServeConn(far)
-	rec := &recorder{Conn: near}
+	rec := &recorder{Conn: pipe(s)}
 	c := client.New(rec, clientKey)
 	defer c.Close()
 	if err := c.Handshake(); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Login("admin", password); err != nil {
+	if _, err := c.Create("secret_recipe", "99.99"); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(rec.sent.String(), password) {
-		t.Fatal("the password is on the wire in plain text")
-	}
-	if _, err := c.Create("rice", "1"); err != nil {
+	if _, err := c.List(); err != nil {
 		t.Fatal(err)
 	}
-	// The CRUD calls are not encrypted: only the login is.
-	if !strings.Contains(rec.sent.String(), "rice") {
-		t.Fatal("the test recorder did not see the bytes")
+	wire := rec.text()
+	for _, word := range []string{"secret_recipe", "99.99", "9999", `"name"`} {
+		if strings.Contains(wire, word) {
+			t.Fatalf("%q is on the wire in plain text", word)
+		}
+	}
+	// net/rpc sends the method names in plain text.
+	if !strings.Contains(wire, "Products.Create") {
+		t.Fatal("the recorder did not see the bytes")
 	}
 }
 
 type recorder struct {
 	net.Conn
-	mu   sync.Mutex
-	sent strings.Builder
+	mu  sync.Mutex
+	all strings.Builder
 }
 
 func (r *recorder) Write(p []byte) (int, error) {
 	r.mu.Lock()
-	r.sent.Write(p)
+	r.all.Write(p)
 	r.mu.Unlock()
 	return r.Conn.Write(p)
+}
+
+func (r *recorder) Read(p []byte) (int, error) {
+	n, err := r.Conn.Read(p)
+	r.mu.Lock()
+	r.all.Write(p[:n])
+	r.mu.Unlock()
+	return n, err
+}
+
+func (r *recorder) text() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.all.String()
+}
+
+func TestLongRepliesUseManyBlocks(t *testing.T) {
+	s, _ := newServer(t)
+	for i := range 30 {
+		if _, err := s.Catalog.Create(fmt.Sprintf("product_%02d", i), "1.25"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := connect(t, s)
+	var traced client.Call
+	c.Trace = func(call client.Call) { traced = call }
+	list, err := c.List()
+	if err != nil || len(list) != 30 {
+		t.Fatalf("List = %d products, %v", len(list), err)
+	}
+	var result service.Result
+	if err := json.Unmarshal(traced.Reply, &result); err != nil || len(result.Products) != 30 {
+		t.Fatalf("traced reply: %v", err)
+	}
+	if want := (len(traced.Reply) + 189) / 190; len(traced.ReplySealed) != want || want < 2 {
+		t.Fatalf("%d bytes in %d blocks, want %d", len(traced.Reply), len(traced.ReplySealed), want)
+	}
 }
 
 func TestManyClientsOverTCP(t *testing.T) {
@@ -316,10 +304,6 @@ func TestManyClientsOverTCP(t *testing.T) {
 				return
 			}
 			defer c.Close()
-			if err := c.Login("admin", password); err != nil {
-				t.Error(err)
-				return
-			}
 			for i := range 5 {
 				if _, err := c.Create(fmt.Sprintf("w%d_%d", w, i), "1"); err != nil {
 					t.Error(err)

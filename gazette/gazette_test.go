@@ -26,145 +26,109 @@ func engine(t *testing.T) *Engine {
 	if shared == nil {
 		t.Fatal("no engine")
 	}
-	if _, err := shared.Do("reset", nil); err != nil {
+	if _, err := shared.Reset(); err != nil {
 		t.Fatal(err)
 	}
 	return shared
 }
 
+func exec(t *testing.T, e *Engine, line string) (Entry, State) {
+	t.Helper()
+	entry, state, _ := e.Exec(line)
+	return entry, state
+}
+
 func TestStartsWithAHandshake(t *testing.T) {
-	e := engine(t)
-	s := e.State()
-	if len(s.Exchanges) != 1 || s.Exchanges[0].Method != "Products.Handshake" {
-		t.Fatalf("exchanges: %+v", s.Exchanges)
+	s := engine(t).State()
+	x := s.Handshake
+	if x == nil || x.Method != "Products.Handshake" || x.Error != "" {
+		t.Fatalf("handshake: %+v", x)
 	}
-	x := s.Exchanges[0]
-	if x.Sent < 294 || x.Received < 294 || x.Error != "" {
-		t.Fatalf("a handshake carries two keys of 294 bytes: %+v", x)
-	}
-	if !strings.Contains(x.Args["ClientKey"].(string), s.ClientKey) || !strings.Contains(x.Reply["ServerKey"].(string), s.ServerKey) {
-		t.Fatalf("the handshake fields do not name the keys: %+v", x)
+	if x.Sent < 294 || x.Received < 294 || len(x.Sealed) != 0 {
+		t.Fatalf("a handshake carries two public keys, not sealed: %+v", x)
 	}
 	if s.ClientKnows != s.ServerKey || s.ClientKey == s.ServerKey {
 		t.Fatalf("keys: %+v", s)
 	}
-	if len(s.Products) != 3 || s.User != "" || s.Bits != 2048 {
+	if len(s.Products) != 3 || s.Bits != 2048 || s.BlockSize != 190 || s.Calls != 1 {
 		t.Fatalf("state: %+v", s)
 	}
-	if len(s.Desk) < 2 || !strings.Contains(s.Desk[1].Text, "handshake: client key "+s.ClientKey) {
-		t.Fatalf("desk: %+v", s.Desk)
+}
+
+func TestACommandIsSealedBothWays(t *testing.T) {
+	e := engine(t)
+	entry, s := exec(t, e, ".create tea 3.50")
+	if entry.Error != "" || entry.Output != "created #4  tea  3.50" || len(s.Products) != 4 {
+		t.Fatalf("entry: %+v", entry)
+	}
+	if len(entry.Calls) != 1 {
+		t.Fatalf("%d calls", len(entry.Calls))
+	}
+	x := entry.Calls[0]
+	if x.Method != "Products.Create" || x.Request != `{"name":"tea","price":"3.50"}` {
+		t.Fatalf("request: %+v", x)
+	}
+	if len(x.Sealed) != 1 || len(x.Sealed[0]) != 512 || len(x.ReplySealed) != 1 {
+		t.Fatalf("sealed blocks: %d and %d", len(x.Sealed), len(x.ReplySealed))
+	}
+	if !strings.Contains(x.Reply, `"name":"tea"`) {
+		t.Fatalf("reply %q", x.Reply)
+	}
+	// The sealed blocks are what went on the wire, and the plaintext is not.
+	if !strings.Contains(x.SentHex, x.Sealed[0]) || !strings.Contains(x.RecvHex, x.ReplySealed[0]) {
+		t.Fatal("the sealed blocks are not in the bytes on the wire")
+	}
+	for _, word := range []string{"tea", "3.50", "name"} {
+		if strings.Contains(x.SentHex+x.RecvHex, hex.EncodeToString([]byte(word))) {
+			t.Fatalf("%q is on the wire in plain text", word)
+		}
+	}
+	if !strings.Contains(x.SentHex, hex.EncodeToString([]byte("Products.Create"))) {
+		t.Fatal("the method name is missing from the wire")
+	}
+	if !strings.Contains(strings.Join(x.Server, "\n"), "created #4 tea at 3.50") {
+		t.Fatalf("server lines: %q", x.Server)
 	}
 }
 
-func TestLoginShowsTheCiphertext(t *testing.T) {
+func TestErrors(t *testing.T) {
 	e := engine(t)
-	s, err := e.Do("login", map[string]string{"user": "admin", "password": "nope"})
-	if err == nil || s.Login == nil || s.Login.OK || s.Login.Error != "wrong user or password" {
-		t.Fatalf("wrong password: %v %+v", err, s.Login)
+	entry, _ := exec(t, e, ".read 99")
+	if entry.Error != "no product has this id" || len(entry.Calls) != 1 || entry.Calls[0].Reply != `{"error":"no product has this id"}` {
+		t.Fatalf("read 99: %+v", entry)
 	}
-	s, err = e.Do("login", map[string]string{"user": DemoUser, "password": DemoPassword})
-	if err != nil {
-		t.Fatal(err)
+	if len(entry.Calls[0].ReplySealed) != 1 {
+		t.Fatal("the error came back without a seal")
 	}
-	if s.User != "admin" || !s.Login.OK || s.Login.Bytes != 256 {
-		t.Fatalf("login: %+v", s.Login)
+	// A typing error never reaches the wire.
+	entry, s := exec(t, e, ".create tea")
+	if !strings.Contains(entry.Error, "usage") || len(entry.Calls) != 0 || s.Calls != 2 {
+		t.Fatalf("usage error: %+v, %d calls", entry, s.Calls)
 	}
-	if s.Login.Plaintext != `{"user":"admin","password":"chatuba"}` {
-		t.Fatalf("plaintext %q", s.Login.Plaintext)
-	}
-	raw, err := hex.DecodeString(s.Login.Ciphertext)
-	if err != nil || len(raw) != 256 {
-		t.Fatalf("ciphertext: %v, %d bytes", err, len(raw))
-	}
-	last := s.Exchanges[len(s.Exchanges)-1]
-	if last.Method != "Products.Login" || !strings.Contains(last.SentHex, s.Login.Ciphertext[:64]) {
-		t.Fatal("the ciphertext is not in the bytes on the wire")
-	}
-	if strings.Contains(last.SentHex, hex.EncodeToString([]byte(DemoPassword))) {
-		t.Fatal("the password is on the wire")
-	}
-}
-
-func TestCRUDActions(t *testing.T) {
-	e := engine(t)
-	if _, err := e.Do("create", map[string]string{"name": "tea", "price": "3"}); err == nil || !strings.Contains(err.Error(), "log in first") {
-		t.Fatalf("create before login: %v", err)
-	}
-	if _, err := e.Do("login", map[string]string{"user": DemoUser, "password": DemoPassword}); err != nil {
-		t.Fatal(err)
-	}
-	s, err := e.Do("create", map[string]string{"name": "tea", "price": "3"})
-	if err != nil || len(s.Products) != 4 || s.Products[3].Name != "tea" {
-		t.Fatalf("create: %v %+v", err, s.Products)
-	}
-	if s, err = e.Do("update", map[string]string{"id": "4", "name": "green_tea", "price": "3.5"}); err != nil || s.Products[3].Price != 350 {
-		t.Fatalf("update: %v %+v", err, s.Products)
-	}
-	if _, err = e.Do("read", map[string]string{"id": "4"}); err != nil {
-		t.Fatal(err)
-	}
-	if s, err = e.Do("delete", map[string]string{"id": "1"}); err != nil || len(s.Products) != 3 {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, err = e.Do("read", map[string]string{"id": "x"}); err == nil {
-		t.Fatal("a bad id was accepted")
-	}
-	if _, err = e.Do("dance", nil); err == nil {
-		t.Fatal("an unknown action worked")
-	}
-	s, err = e.Do("list", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	last := s.Exchanges[len(s.Exchanges)-1]
-	if last.Method != "Products.List" || last.Reply["Products"] != "3 products" {
-		t.Fatalf("list exchange: %+v", last)
-	}
-	if s, _ = e.Do("logout", nil); s.User != "" {
-		t.Fatal("still logged in after logout")
-	}
-}
-
-func TestGobSendsTypesOnce(t *testing.T) {
-	e := engine(t)
-	_, _ = e.Do("login", map[string]string{"user": DemoUser, "password": DemoPassword})
-	first, _ := e.Do("read", map[string]string{"id": "1"})
-	second, _ := e.Do("read", map[string]string{"id": "2"})
-	a, b := first.Exchanges[len(first.Exchanges)-1], second.Exchanges[len(second.Exchanges)-1]
-	if a.Received <= b.Received {
-		t.Fatalf("the first reply of a type carries its definition: %d then %d bytes", a.Received, b.Received)
-	}
-}
-
-func TestExec(t *testing.T) {
-	e := engine(t)
-	out, s, err := e.Exec(".login admin chatuba")
-	if err != nil || out != "logged in as admin" || s.User != "admin" || s.Login == nil || !s.Login.OK {
-		t.Fatalf("exec login: %q %v %+v", out, err, s.Login)
-	}
-	out, _, err = e.Exec(".list")
-	if err != nil || !strings.Contains(out, "#2  coffee  12.90") {
-		t.Fatalf("exec list: %q %v", out, err)
-	}
-	if _, _, err = e.Exec(".quit"); err == nil {
+	if entry, _ = exec(t, e, ".quit"); entry.Error == "" {
 		t.Fatal(".quit must not close the page connection")
 	}
-	if _, s, _ = e.Exec(".list"); len(s.Exchanges) == 0 {
-		t.Fatal("the connection closed")
+	if entry, _ = exec(t, e, ".list"); entry.Error != "" || !strings.Contains(entry.Output, "#3  bread  0.80") {
+		t.Fatalf("the connection does not work after .quit: %+v", entry)
 	}
-	before := s.Login
-	_, s, _ = e.Exec(".read 1")
-	if s.Login != before {
-		t.Fatal("a command without login changed the login view")
+}
+
+func TestLongListsUseManyBlocks(t *testing.T) {
+	e := engine(t)
+	for i := range 6 {
+		exec(t, e, ".create product_number_"+string(rune('a'+i))+" 1")
+	}
+	entry, _ := exec(t, e, ".list")
+	if n := len(entry.Calls[0].ReplySealed); n < 2 {
+		t.Fatalf("a list of 9 products came in %d block", n)
 	}
 }
 
 func TestResetStartsAgain(t *testing.T) {
 	e := engine(t)
-	_, _ = e.Do("login", map[string]string{"user": DemoUser, "password": DemoPassword})
-	_, _ = e.Do("delete", map[string]string{"id": "1"})
-	s, err := e.Do("reset", nil)
-	if err != nil || len(s.Products) != 3 || s.User != "" || s.Login != nil || len(s.Exchanges) != 1 || s.Calls != 1 {
+	exec(t, e, ".delete 1")
+	s, err := e.Reset()
+	if err != nil || len(s.Products) != 3 || s.Calls != 1 || s.Handshake == nil {
 		t.Fatalf("reset: %v %+v", err, s)
 	}
 }

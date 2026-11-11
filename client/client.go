@@ -1,10 +1,13 @@
-// Package client calls the catalog service with net/rpc.
+// Package client calls the catalog service with net/rpc. Every request is
+// sealed with the public key of the server, and every reply is opened with
+// the private key of the client.
 package client
 
 import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/rpc"
@@ -15,6 +18,17 @@ import (
 	"github.com/rahelmartim/go-rpc-rsa-crud/service"
 )
 
+// Call describes one finished call, for a trace.
+type Call struct {
+	Method      string
+	Request     []byte   // the plaintext of the request
+	Sealed      [][]byte // the request as it went on the wire
+	ReplySealed [][]byte // the reply as it came from the wire
+	Reply       []byte   // the plaintext of the reply
+	Err         error
+	Took        time.Duration
+}
+
 // Client is one connection to the server.
 type Client struct {
 	rpc *rpc.Client
@@ -22,10 +36,8 @@ type Client struct {
 	Key *rsa.PrivateKey
 	// ServerKey is the public key that the server sent in the handshake.
 	ServerKey *rsa.PublicKey
-	// LastLogin is the last login message that Login sent.
-	LastLogin Sealed
 	// Trace, if set, receives every call after its reply.
-	Trace func(method string, args, reply any, err error, took time.Duration)
+	Trace func(Call)
 }
 
 // Dial connects to a server over TCP and does the handshake.
@@ -49,31 +61,43 @@ func New(conn io.ReadWriteCloser, key *rsa.PrivateKey) *Client {
 }
 
 func (c *Client) call(method string, args, reply any) error {
-	start := time.Now()
 	err := c.rpc.Call(service.Name+"."+method, args, reply)
 	var se rpc.ServerError
 	if errors.As(err, &se) {
 		// The server sends errors as text. Keep the text, without the type.
 		err = errors.New(string(se))
 	}
-	if c.Trace != nil {
-		c.Trace(method, args, reply, err, time.Since(start))
-	}
 	return err
 }
 
+func (c *Client) trace(call Call) {
+	if c.Trace != nil {
+		c.Trace(call)
+	}
+}
+
 // Handshake sends the public key of the client and keeps the key of the
-// server.
+// server. Public keys are not secret, so the handshake is not sealed.
 func (c *Client) Handshake() error {
+	start := time.Now()
 	der, err := keys.Marshal(&c.Key.PublicKey)
 	if err != nil {
 		return err
 	}
 	var reply service.HandshakeReply
-	if err := c.call("Handshake", service.HandshakeArgs{ClientKey: der}, &reply); err != nil {
-		return err
+	err = c.call("Handshake", service.HandshakeArgs{ClientKey: der}, &reply)
+	var pub *rsa.PublicKey
+	if err == nil {
+		pub, err = keys.Parse(reply.ServerKey)
 	}
-	pub, err := keys.Parse(reply.ServerKey)
+	call := Call{
+		Method: "Handshake", Err: err, Took: time.Since(start),
+		Request: []byte(fmt.Sprintf("public key of the client, %d bytes", len(der))),
+	}
+	if pub != nil {
+		call.Reply = []byte(fmt.Sprintf("public key of the server, %d bytes", len(reply.ServerKey)))
+	}
+	c.trace(call)
 	if err != nil {
 		return err
 	}
@@ -81,78 +105,79 @@ func (c *Client) Handshake() error {
 	return nil
 }
 
-// Sealed is a login message: its plaintext, and the ciphertext that goes
-// on the wire.
-type Sealed struct {
-	Plaintext  []byte
-	Ciphertext []byte
-}
-
-// Seal encrypts the credentials with the public key of the server. Only
-// the private key of the server can open them.
-func (c *Client) Seal(user, password string) (Sealed, error) {
+// send seals a request, calls the method, and opens the reply.
+func (c *Client) send(method string, req service.Request) (service.Result, error) {
+	var result service.Result
 	if c.ServerKey == nil {
-		return Sealed{}, service.ErrNoHandshake
+		return result, service.ErrNoHandshake
 	}
-	plain, err := json.Marshal(service.Credentials{User: user, Password: password})
+	start := time.Now()
+	call := Call{Method: method}
+	defer func() {
+		call.Took = time.Since(start)
+		c.trace(call)
+	}()
+
+	call.Request, _ = json.Marshal(req)
+	sealed, err := keys.Seal(c.ServerKey, call.Request)
 	if err != nil {
-		return Sealed{}, err
+		call.Err = err
+		return result, err
 	}
-	ct, err := keys.Encrypt(c.ServerKey, plain)
+	call.Sealed = sealed
+	var reply service.Sealed
+	if err := c.call(method, service.Sealed{Blocks: sealed}, &reply); err != nil {
+		call.Err = err
+		return result, err
+	}
+	call.ReplySealed = reply.Blocks
+	plain, err := keys.Open(c.Key, reply.Blocks)
 	if err != nil {
-		return Sealed{}, errors.New("the user and the password are too long to encrypt")
+		call.Err = errors.New("the client cannot open the reply with its key")
+		return result, call.Err
 	}
-	return Sealed{Plaintext: plain, Ciphertext: ct}, nil
+	call.Reply = plain
+	if err := json.Unmarshal(plain, &result); err != nil {
+		call.Err = errors.New("the reply is not valid JSON")
+		return result, call.Err
+	}
+	if result.Error != "" {
+		call.Err = errors.New(result.Error)
+		return result, call.Err
+	}
+	return result, nil
 }
 
-// SendLogin sends a sealed login message.
-func (c *Client) SendLogin(sealed Sealed) (string, error) {
-	var reply service.Message
-	err := c.call("Login", service.LoginArgs{Ciphertext: sealed.Ciphertext}, &reply)
-	return reply.Text, err
-}
-
-// Login seals the credentials and sends them.
-func (c *Client) Login(user, password string) error {
-	sealed, err := c.Seal(user, password)
+func product(r service.Result, err error) (catalog.Product, error) {
 	if err != nil {
-		return err
+		return catalog.Product{}, err
 	}
-	c.LastLogin = sealed
-	_, err = c.SendLogin(sealed)
-	return err
-}
-
-func (c *Client) Logout() error {
-	return c.call("Logout", service.Message{}, &service.Message{})
+	if r.Product == nil {
+		return catalog.Product{}, errors.New("the reply has no product")
+	}
+	return *r.Product, nil
 }
 
 func (c *Client) Create(name, price string) (catalog.Product, error) {
-	var p catalog.Product
-	err := c.call("Create", service.ProductArgs{Name: name, Price: price}, &p)
-	return p, err
+	return product(c.send("Create", service.Request{Name: name, Price: price}))
 }
 
 func (c *Client) Read(id int) (catalog.Product, error) {
-	var p catalog.Product
-	err := c.call("Read", service.IDArgs{ID: id}, &p)
-	return p, err
+	return product(c.send("Read", service.Request{ID: id}))
 }
 
 func (c *Client) Update(id int, name, price string) (catalog.Product, error) {
-	var p catalog.Product
-	err := c.call("Update", service.ProductArgs{ID: id, Name: name, Price: price}, &p)
-	return p, err
+	return product(c.send("Update", service.Request{ID: id, Name: name, Price: price}))
 }
 
 func (c *Client) Delete(id int) error {
-	return c.call("Delete", service.IDArgs{ID: id}, &service.Message{})
+	_, err := c.send("Delete", service.Request{ID: id})
+	return err
 }
 
 func (c *Client) List() ([]catalog.Product, error) {
-	var reply service.ListReply
-	err := c.call("List", service.Message{}, &reply)
-	return reply.Products, err
+	r, err := c.send("List", service.Request{})
+	return r.Products, err
 }
 
 func (c *Client) Close() error {

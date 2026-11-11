@@ -1,5 +1,5 @@
 /* The RPC Gazette. The Go server and client run in WebAssembly (see
-   cmd/gazette-wasm). This file only draws their state. */
+   cmd/gazette-wasm). This file types their story on the sheet. */
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -18,7 +18,13 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const EXAMPLES = [".list", ".create tea 3.50", ".read 1", ".update 1 brown_rice 5", ".delete 3", ".read 99", ".help", ".clear"];
+
 let state = null;
+let known = new Map(); // product id → "name price", to mark changed rows
+const history = [];
+let back = 0;
 
 /* Talking to Go */
 
@@ -45,99 +51,102 @@ async function start() {
     go.run(result.instance);
     await ready;
   } catch (error) {
-    $("#presses").textContent = `The presses stopped: ${error.message}`;
+    $("#presses").textContent = `The typewriter jammed: ${error.message}`;
     return;
   }
   $("#presses").hidden = true;
-  $("#paper").hidden = false;
-  await act("state");
+  $("#desk").hidden = false;
+  setupChips();
+  const reply = JSON.parse(await window.gazette.state());
+  show(reply.state);
+  printHandshake();
+  $("#line").focus();
 }
 
-// act runs an action in Go and draws the new state. It returns the error
-// text, or "" when the action worked.
-async function act(action, args = {}) {
-  // Go reads the arguments as a map of strings.
-  const strings = Object.fromEntries(Object.entries(args).map(([k, v]) => [k, String(v)]));
-  const reply = JSON.parse(await window.gazette.do(action, JSON.stringify(strings)));
-  state = reply.state;
-  render();
-  return reply.ok ? "" : reply.error;
-}
+/* The keys and the catalog */
 
-/* Drawing */
-
-const clock = (iso) => new Date(iso).toLocaleTimeString("en-GB", { hour12: false });
-
-function render() {
-  if (!state) return;
-  $("#issue").textContent = `No. ${state.calls} · ${state.bytes.toLocaleString("en-US")} bytes printed`;
+function show(next) {
+  state = next;
+  $("#issue").textContent = `No. ${state.calls} · ${state.bytes.toLocaleString("en-US")} bytes on the wire`;
   $("#client-key").textContent = state.clientKey;
   $("#server-key").textContent = state.serverKey;
   $("#client-knows").textContent = state.clientKnows || "no handshake yet";
+  $("#block-size").textContent = state.blockSize;
   const same = state.clientKnows === state.serverKey;
-  $("#match").textContent = same ? "✓ the same key as the server" : "✗ not the key of the server";
+  $("#match").textContent = same ? "✓ it arrived intact" : "✗ not the key of the server";
   $("#match").className = `match${same ? "" : " bad"}`;
-  renderLogin();
-  renderProducts();
-  renderDesk();
-  renderWire();
-}
 
-function renderLogin() {
-  const login = state.login;
-  $("#sealed").hidden = !login;
-  if (!login) return;
-  $("#plaintext").textContent = login.plaintext || "(nothing was sent)";
-  $("#ciphertext").textContent = login.ciphertext ? login.ciphertext.match(/.{1,48}/g).join("\n") : "";
-  $("#cipher-size").textContent = login.bytes ? `· ${login.bytes} bytes` : "";
-  const verdict = $("#verdict");
-  verdict.className = `verdict ${login.ok ? "ok" : "bad"}`;
-  verdict.textContent = login.ok
-    ? `The server opened the envelope with its private key, and ${state.user} is logged in on this connection.`
-    : `The server refused it: ${login.error}.`;
-}
-
-function renderProducts() {
-  $("#session-line").textContent = state.user
-    ? `Logged in as ${state.user}. The list shows the catalog as the server stores it.`
-    : "You are not logged in. The list shows the catalog as the server stores it, but the server refuses your calls. Try one, then read the wire.";
   const body = $("#products");
   body.replaceChildren();
+  const seen = new Map();
   for (const p of state.products) {
+    const line = `${p.name} ${p.price}`;
+    seen.set(p.id, line);
+    const changed = known.size > 0 && known.get(p.id) !== line;
     body.append(
-      el("tr", {},
+      el("tr", { class: changed ? "changed" : "" },
         el("td", { class: "no" }, `#${p.id}`),
-        el("td", { class: "item" }, p.name),
-        el("td", { class: "num" }, (p.price / 100).toFixed(2)),
-        el("td", { class: "actions" },
-          el("button", { type: "button", title: "Call Products.Read", onclick: () => run("read", { id: p.id }, `Read #${p.id}.`) }, "read"),
-          el("button", { type: "button", title: "Change this product", onclick: () => edit(p) }, "edit"),
-          el("button", { type: "button", title: "Call Products.Delete", onclick: () => run("delete", { id: p.id }, `Removed #${p.id}.`) }, "remove"))),
+        el("td", {}, p.name),
+        el("td", { class: "num" }, (p.price / 100).toFixed(2))),
     );
   }
-  if (!state.products.length) body.append(el("tr", { class: "empty" }, el("td", { colspan: 4 }, "No ads today.")));
+  if (!state.products.length) body.append(el("tr", {}, el("td", { colspan: 3, class: "no" }, "The catalog is empty.")));
+  known = seen;
 }
 
-function renderDesk() {
-  const list = $("#desk");
-  list.replaceChildren(
-    ...[...state.desk].reverse().map((line) =>
-      el("li", { class: /refused/.test(line.text) ? "refused" : "" },
-        el("time", {}, `${clock(line.time)} · connection ${line.conn}`), line.text)),
-  );
+/* Typing on the sheet */
+
+const randomHex = (n) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+
+// scramble shows random hex that settles into the real ciphertext.
+function scramble(node, text) {
+  if (still) {
+    node.textContent = text;
+    return;
+  }
+  const start = performance.now();
+  const step = (now) => {
+    const done = Math.min(1, (now - start) / 450);
+    const fixed = Math.floor(text.length * done);
+    node.textContent = text.slice(0, fixed) + randomHex(text.length - fixed);
+    if (done < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
-function fields(map) {
-  const entries = Object.entries(map ?? {});
-  if (!entries.length) return [el("dt", {}, "fields"), el("dd", {}, "none")];
-  return entries.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, String(v))]);
+// typeOut types the text one letter at a time, like a typewriter.
+function typeOut(node, text) {
+  if (still || text.length > 600) {
+    node.textContent = text;
+    return;
+  }
+  let i = 0;
+  const each = Math.max(4, Math.min(14, 500 / Math.max(1, text.length)));
+  const tick = () => {
+    i += 1;
+    node.textContent = text.slice(0, i);
+    if (i < text.length) setTimeout(tick, each);
+  };
+  tick();
+}
+
+function sealedCell(blocks, key, animate) {
+  if (!blocks?.length) return [el("span", { class: "stamp open" }, "not sealed"), el("span", { class: "cipher" }, "")];
+  const preview = blocks[0].slice(0, 32) + "…";
+  const text = el("span", {});
+  if (animate) scramble(text, preview);
+  else text.textContent = preview;
+  return [
+    el("span", { class: "stamp", title: `RSA-OAEP with the ${key} key` }, `sealed · ${key} key`),
+    el("span", { class: "cipher" }, text, el("small", {}, `${blocks.length} block${blocks.length > 1 ? "s" : ""} · ${blocks.length * 256} bytes`)),
+  ];
 }
 
 // dump writes bytes like hexdump: offset, 16 bytes, and their text.
 function dump(hex, total) {
   const bytes = hex.match(/../g) ?? [];
   const lines = [];
-  for (let i = 0; i < bytes.length && i < 512; i += 16) {
+  for (let i = 0; i < bytes.length && i < 768; i += 16) {
     const row = bytes.slice(i, i + 16);
     const text = row.map((b) => {
       const c = parseInt(b, 16);
@@ -145,103 +154,94 @@ function dump(hex, total) {
     }).join("");
     lines.push(`${i.toString(16).padStart(4, "0")}  ${row.join(" ").padEnd(47)}  ${text}`);
   }
-  if (total > Math.min(bytes.length, 512)) lines.push(`… ${total - Math.min(bytes.length, 512)} more bytes`);
+  const shown = Math.min(bytes.length, 768);
+  if (total > shown) lines.push(`… ${total - shown} more bytes`);
   return lines.join("\n");
 }
 
-function renderWire() {
-  const box = $("#stories");
-  box.replaceChildren(
-    ...[...state.exchanges].reverse().map((x) =>
-      el("article", { class: "story" },
-        el("h3", {}, x.method),
-        el("p", { class: "meta" }, `No. ${x.seq} · ${clock(x.time)} · ${x.sent} B out · ${x.received} B in · ${x.millis.toFixed(1)} ms`),
-        el("dl", {}, el("dt", {}, "sent"), el("dd", {}, ""), ...fields(x.args)),
-        x.error
-          ? el("p", { class: "refused" }, `Refused: ${x.error}`)
-          : el("dl", {}, el("dt", {}, "reply"), el("dd", {}, ""), ...fields(x.reply)),
-        el("details", {},
-          el("summary", {}, "Bytes on the wire"),
-          el("p", { class: "label" }, "client → server"),
-          el("pre", { class: "dump" }, dump(x.sentHex, x.sent)),
-          el("p", { class: "label" }, "server → client"),
-          el("pre", { class: "dump" }, dump(x.recvHex, x.received))))),
+// clip keeps a line of the sheet short. The full text is in its tooltip.
+const clip = (text) => (text.length > 100 ? `${text.slice(0, 100)}…` : text);
+
+function callView(x, animate) {
+  const handshake = x.method === "Products.Handshake";
+  return [
+    el("div", { class: "leg out" },
+      el("span", { class: "arrow", title: "client to server" }, "→"),
+      el("span", { class: "plain", title: x.request }, el("span", { class: "method" }, x.method), clip(x.request) || "(nothing)"),
+      ...sealedCell(x.sealed, "server", animate && !handshake)),
+    el("div", { class: "leg back" },
+      el("span", { class: "arrow", title: "server to client" }, "←"),
+      el("span", { class: "plain", title: x.reply }, clip(x.reply) || (x.error ? `error: ${x.error}` : "(nothing)")),
+      ...sealedCell(x.replySealed, "client", animate && !handshake)),
+    el("details", {},
+      el("summary", {}, `bytes on the wire · ${x.sent} out, ${x.received} in · ${x.millis.toFixed(1)} ms`),
+      x.sealed.length ? el("pre", { class: "dump" }, `the request, sealed (${x.sealed.length} × 256 bytes):\n`, el("b", {}, x.sealed.join("\n"))) : null,
+      el("pre", { class: "dump" }, `client → server, as gob:\n${dump(x.sentHex, x.sent)}`),
+      el("pre", { class: "dump" }, `server → client, as gob:\n${dump(x.recvHex, x.received)}`)),
+  ];
+}
+
+function print(entry, { system = false } = {}) {
+  const output = el("p", { class: `output${entry.error ? " err" : ""}` });
+  const node = el("article", { class: "entry" },
+    el("p", { class: `typed${system ? " system" : ""}` }, system ? null : el("span", { class: "prompt" }, ">"), entry.line),
+    ...entry.calls.flatMap((x) => callView(x, true)),
+    output);
+  $("#entries").append(node);
+  typeOut(output, entry.error ? `error: ${entry.error}` : entry.output);
+  node.scrollIntoView({ block: "nearest", behavior: still ? "auto" : "smooth" });
+  $("#carriage").scrollIntoView({ block: "nearest" });
+}
+
+function printHandshake() {
+  if (!state.handshake) return;
+  print({ line: "The client connects, and the two sides trade public keys.", output: "Keys exchanged. Everything from here on is sealed.", calls: [state.handshake] }, { system: true });
+}
+
+/* The carriage */
+
+async function type(line) {
+  line = line.trim();
+  if (!line) return;
+  history.push(line);
+  back = history.length;
+  if (line.toLowerCase() === ".clear") {
+    $("#entries").replaceChildren();
+    return;
+  }
+  const reply = JSON.parse(await window.gazette.exec(line));
+  show(reply.state);
+  print(reply.entry);
+}
+
+$("#carriage").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#line");
+  const line = input.value;
+  input.value = "";
+  await type(line);
+});
+
+$("#line").addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+  event.preventDefault();
+  back = Math.max(0, Math.min(history.length, back + (event.key === "ArrowUp" ? -1 : 1)));
+  event.currentTarget.value = history[back] ?? "";
+});
+
+function setupChips() {
+  $("#chips").replaceChildren(
+    ...EXAMPLES.map((line) =>
+      el("button", { type: "button", onclick: () => { $("#line").value = line; $("#line").focus(); } }, line)),
   );
 }
 
-/* Actions */
-
-function notice(text, bad = false) {
-  $("#notice").textContent = text;
-  $("#notice").className = `notice${bad ? " bad" : ""}`;
-}
-
-async function run(action, args, done) {
-  const error = await act(action, args);
-  notice(error ? `The server refused it: ${error}.` : done, Boolean(error));
-  return error;
-}
-
-function edit(p) {
-  const { elements } = $("#product-form");
-  elements.id.value = p.id;
-  elements.name.value = p.name;
-  elements.price.value = (p.price / 100).toFixed(2);
-  $("#form-title").textContent = `Change ad #${p.id}`;
-  $("#product-save").textContent = "Reprint it";
-  $("#product-cancel").hidden = false;
-  elements.name.focus();
-}
-
-function resetForm() {
-  const form = $("#product-form");
-  form.reset();
-  form.elements.id.value = "";
-  $("#form-title").textContent = "Place an ad";
-  $("#product-save").textContent = "Print it";
-  $("#product-cancel").hidden = true;
-}
-
-$("#product-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const { id, name, price } = Object.fromEntries(new FormData(form));
-  const error = id
-    ? await run("update", { id, name, price }, `Ad #${id} was reprinted.`)
-    : await run("create", { name, price }, `The ad for ${name.trim()} was printed.`);
-  if (!error) resetForm();
-});
-
-$("#product-cancel").addEventListener("click", resetForm);
-
-$("#login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const { user, password } = Object.fromEntries(new FormData(event.currentTarget));
-  await act("login", { user, password });
-});
-
-$("#logout").addEventListener("click", () => run("logout", {}, "You logged out."));
-
 $("#reset").addEventListener("click", async () => {
-  resetForm();
-  notice("");
-  $("#tape").replaceChildren("A new connection. Type .help for the list of commands.");
-  await act("reset");
-});
-
-$("#telegraph-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const input = event.currentTarget.line;
-  const line = input.value.trim();
-  if (!line) return;
-  input.value = "";
-  const reply = JSON.parse(await window.gazette.exec(line));
-  state = reply.state;
-  render();
-  const tape = $("#tape");
-  tape.append("\n", el("span", { class: "cmd" }, `> ${line}`), "\n",
-    reply.ok ? reply.output : el("span", { class: "err" }, `error: ${reply.error}`));
-  tape.scrollTop = tape.scrollHeight;
+  const reply = JSON.parse(await window.gazette.reset());
+  known = new Map();
+  $("#entries").replaceChildren();
+  show(reply.state);
+  printHandshake();
 });
 
 start();

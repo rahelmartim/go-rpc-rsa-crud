@@ -101,3 +101,47 @@ func TestFingerprint(t *testing.T) {
 		t.Fatal("a fingerprint must be the same for one key and differ between keys")
 	}
 }
+
+func TestSealOpen(t *testing.T) {
+	key, _ := Generate()
+	if BlockSize(&key.PublicKey) != 190 {
+		t.Fatalf("block size %d, want 190", BlockSize(&key.PublicKey))
+	}
+	for _, n := range []int{0, 1, 190, 191, 1000} {
+		message := bytes.Repeat([]byte("x"), n)
+		blocks, err := Seal(&key.PublicKey, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := max(1, (n+189)/190); len(blocks) != want {
+			t.Fatalf("%d bytes in %d blocks, want %d", n, len(blocks), want)
+		}
+		plain, err := Open(key, blocks)
+		if err != nil || !bytes.Equal(plain, message) {
+			t.Fatalf("Open of %d bytes: %v", n, err)
+		}
+	}
+}
+
+func TestOpenRefusesBadBlocks(t *testing.T) {
+	key, _ := Generate()
+	other, _ := Generate()
+	blocks, _ := Seal(&key.PublicKey, []byte("hello"))
+	cases := map[string][][]byte{
+		"no blocks":   nil,
+		"short block": {[]byte("short")},
+		"junk":        {make([]byte, 256)},
+		"too many":    make([][]byte, MaxBlocks+1),
+	}
+	for name, b := range cases {
+		if _, err := Open(key, b); !errors.Is(err, ErrCannotOpen) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := Open(other, blocks); !errors.Is(err, ErrCannotOpen) {
+		t.Error("another key opened the message")
+	}
+	if _, err := Seal(&key.PublicKey, make([]byte, 190*MaxBlocks+1)); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("a message that is too large: %v", err)
+	}
+}

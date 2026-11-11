@@ -20,7 +20,7 @@ type Product struct {
 }
 
 // MaxProducts limits the size of the catalog.
-const MaxProducts = 1000
+const MaxProducts = 500
 
 var (
 	ErrNotFound = errors.New("no product has this id")
