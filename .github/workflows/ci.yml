@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: GOOS=js GOARCH=wasm go vet ./cmd/gazette-wasm
+      - run: go test -race ./...
+      - run: make web
+      # The runner image includes Google Chrome.
+      - name: Browser tests
+        run: node --test web/test/gazette.test.js

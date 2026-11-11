@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+    <title>The RPC Gazette · Go net/rpc, sealed with RSA</title>
+    <meta name="description" content="Type commands to a Go net/rpc server in your browser. Every request and every reply is sealed with RSA, and the page shows what goes on the wire." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='%23f4efe3'/><text x='32' y='46' font-family='Courier New,monospace' font-size='42' font-weight='700' text-anchor='middle' fill='%23a3241d'>R</text></svg>" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Special+Elite&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="dateline">
+        <span id="date"></span>
+        <span>Typed in your browser</span>
+        <span id="issue">No. 0</span>
+      </div>
+      <h1 class="title">The RPC Gazette</h1>
+      <p class="motto">You type in plain text. The wire carries it sealed with RSA.</p>
+      <nav class="sections" aria-label="Sections">
+        <a href="#how">How it works</a>
+        <a href="https://github.com/rahelmartim/go-rpc-rsa-crud" target="_blank" rel="noopener noreferrer">Source</a>
+        <button class="link" id="reset" type="button">Start over</button>
+      </nav>
+    </header>
+
+    <p class="presses" id="presses" role="status">Loading the ribbon: Go is making two 2048-bit RSA keys…</p>
+
+    <main class="desk" id="desk" hidden>
+      <section class="ribbon" aria-label="Keys">
+        <div>
+          <span class="label">Client key</span>
+          <code id="client-key">…</code>
+        </div>
+        <div>
+          <span class="label">Server key</span>
+          <code id="server-key">…</code>
+        </div>
+        <div>
+          <span class="label">Server key, as received</span>
+          <code id="client-knows">…</code>
+          <span class="match" id="match"></span>
+        </div>
+        <p class="rule">
+          <span class="red">Requests</span> are sealed with the server key, and <span class="red">replies</span> with
+          the client key. RSA-OAEP with SHA-256, <span id="block-size">190</span> bytes in each 256-byte block.
+        </p>
+      </section>
+
+      <section class="sheet" aria-label="Typed commands">
+        <div class="entries" id="entries" aria-live="polite"></div>
+        <form class="carriage" id="carriage" autocomplete="off">
+          <span class="prompt" aria-hidden="true">&gt;</span>
+          <input name="line" id="line" placeholder="type a command, such as .list" maxlength="200" aria-label="Command" spellcheck="false" autofocus />
+          <button class="key">Return</button>
+        </form>
+        <div class="chips" id="chips" aria-label="Examples"></div>
+      </section>
+
+      <aside class="margin">
+        <h2 class="margin-title">On the server</h2>
+        <p class="note">The catalog as the server keeps it, after it opens your sealed commands.</p>
+        <table class="catalog">
+          <thead><tr><th>No.</th><th>Item</th><th class="num">Price</th></tr></thead>
+          <tbody id="products"></tbody>
+        </table>
+        <h2 class="margin-title">How to read a line</h2>
+        <dl class="legend">
+          <dt><span class="arrow">→</span></dt>
+          <dd>what the client wrote, then the same request as it went on the wire</dd>
+          <dt><span class="arrow">←</span></dt>
+          <dd>the reply on the wire, then what the client read after it opened it</dd>
+          <dt><span class="stamp">sealed</span></dt>
+          <dd>RSA ciphertext: without the private key, nobody can read it</dd>
+        </dl>
+      </aside>
+    </main>
+
+    <section class="how" id="how" aria-label="How it works">
+      <h2 class="section-title">How it works</h2>
+      <div class="how-grid">
+        <article>
+          <h3>1. The handshake</h3>
+          <p>The client and the server each make a 2048-bit RSA key pair. The client calls <code>Products.Handshake</code> with its public key, and the server replies with its own. Public keys are not secret, so this call is not sealed.</p>
+        </article>
+        <article>
+          <h3>2. Sealed requests</h3>
+          <p>For each command, the client writes the request as JSON and encrypts it with the public key of the server (RSA-OAEP). Only the private key of the server can open it. A long message is cut into blocks of 190 bytes.</p>
+        </article>
+        <article>
+          <h3>3. Sealed replies</h3>
+          <p>The server opens the request, runs it on the catalog, and seals the reply with the public key of the client. Errors, such as an unknown id, are inside the sealed reply too.</p>
+        </article>
+        <article>
+          <h3>4. What the wire shows</h3>
+          <p><code>net/rpc</code> sends the method name, such as <code>Products.Create</code>, in plain text, and the sealed blocks encoded by <code>encoding/gob</code>. Open "bytes on the wire" under a command to see them.</p>
+        </article>
+      </div>
+    </section>
+
+    <footer class="colophon">
+      Typed in Go by <a href="https://github.com/rahelmartim" target="_blank" rel="noopener noreferrer">rahelmartim</a>.
+      The server and the client run in this page with WebAssembly, over an in-memory connection.
+    </footer>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
